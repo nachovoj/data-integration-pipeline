@@ -1,0 +1,36 @@
+# Core Python environment
+jupyter>=1.0.0
+ipykernel>=6.29.5
+PyYAML>=6.0
+
+# Data manipulation
+pandas>=2.2.2
+numpy>=1.26.4
+
+# API access and environment variables
+requests>=2.32.3
+python-dotenv>=1.0.1
+
+# Database management
+sqlite-utils>=3.36.0
+
+# Country and ISO code matching
+pycountry>=23.12.11
+
+# Visualization
+matplotlib>=3.9.2
+seaborn>=0.13.2
+
+# Quarto and notebook rendering
+nbformat>=5.10.4
+nbclient>=0.10.0
+quarto-cli>=1.4.550
+jinja2>=3.1.3
+pygments>=2.17.2
+markdown-it-py>=3.0.0
+
+# Utility
+pathlib>=1.0.1
+
+# Note: install TinyTeX manually if PDF rendering is needed
+# quarto install tinytex

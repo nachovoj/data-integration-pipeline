@@ -1,0 +1,46 @@
+# R temporary files
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.log
+
+# Jupyter / Quarto cache
+.ipynb_checkpoints/
+*_files/
+notebooks/*_files/
+__quartobuild__/
+.quarto/
+/.quarto/
+**/*.quarto_ipynb
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment variables
+.env
+
+# Auto-generated datasets and outputs (ignore files but keep folders)
+data/processed/*
+!data/processed/.gitkeep
+data/raw/*
+!data/raw/gdp_raw.csv
+!data/raw/.gitkeep
+data/global_data.db
+figures/*
+!figures/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Keep manually downloaded inputs
+!data/raw/gdp_raw.csv

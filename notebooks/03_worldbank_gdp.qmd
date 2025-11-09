@@ -1,0 +1,530 @@
+---
+title: "Data Integration and Analysis – World Bank GDP"
+author: "Ignacio Vélez Ocampo"
+date: today
+format: html
+jupyter: python3
+execute:
+  dir: project
+  echo: true
+  warning: false
+  message: false
+---
+
+## 1. Project Objective
+
+This notebook represents the **final integration stage** of the data pipeline developed throughout this project. It combines three previously created datasets — **ScrapeThisSite** (geographical data), **OpenWeather API** (climatic data), and **World Bank GDP** (economic data) — into a single, reproducible structure.
+
+The purpose is to harmonize these sources through consistent ISO country codes, enrich the database with economic indicators, and enable analytical exploration through SQL queries and visualizations.
+
+The workflow is divided into the following stages:
+
+1.  **Fetch** official country metadata from the World Bank API to ensure consistent ISO codes.
+2.  **Load and clean** the GDP dataset, removing redundant metadata and regional aggregates.
+3.  **Reshape** the dataset into tidy format for easier integration and SQL queries.
+4.  **Store** the cleaned GDP data in the SQLite database.
+5.  **Integrate** all sources (Scraping, Weather, and GDP) into a unified table.
+6.  **Compute and visualize** average GDP trends across decades.
+
+------------------------------------------------------------------------
+
+## 2. Environment Setup
+
+We begin by importing the necessary libraries and defining a consistent directory structure for reproducibility.
+
+This ensures the notebook runs seamlessly from both Quarto and terminal environments.
+
+```{python}
+# 2. Environment Setup --------------------------------------------------------
+"""
+Import core libraries, configure reproducible paths, and validate
+the data folder structure for subsequent integration.
+"""
+
+from pathlib import Path
+import pandas as pd
+import sqlite3
+import requests
+import warnings
+
+# Configure pandas display options and suppress warnings
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 120)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def find_project_root(marker: str = "data") -> Path:
+    """
+    Locate project root by traversing upward until the given marker folder is found.
+    Ensures compatibility across Quarto, Jupyter, and terminal executions.
+    """
+    path = Path.cwd().resolve()
+    for _ in range(6):
+        if (path / marker).exists():
+            return path
+        path = path.parent
+    return Path.cwd().resolve()
+
+
+# Detect project root and define directories
+project_root = find_project_root()
+data_raw = project_root / "data" / "raw"
+data_processed = project_root / "data" / "processed"
+db_path = project_root / "data" / "global_data.db"
+figures_dir = project_root / "figures"
+reports_dir = project_root / "reports"
+
+# Ensure directories exist
+for folder in [data_processed, figures_dir, reports_dir]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+print(f"Project root detected: {project_root}")
+print(f"Database path: {db_path}")
+
+```
+
+------------------------------------------------------------------------
+
+## 3. Fetch and Understand Country Metadata
+
+Before integrating GDP data, we need a clean reference of valid countries and standardized ISO codes. Inconsistent naming conventions — such as *“Czechia”* vs *“Czech Republic”* — would cause mismatches when joining tables.
+
+To avoid this, we retrieve official metadata from the **World Bank API**, which provides ISO-3 and ISO-2 codes, country names, and capitals. This auxiliary dataset will later help filter out regional aggregates (like *“High income”*) and align all datasets on a single key.
+
+```{python}
+# 3. Fetch and Understand Country Metadata ------------------------------------
+"""
+Retrieve official World Bank country metadata to harmonize ISO codes and
+filter out regional aggregates. Store the metadata for reproducibility.
+"""
+
+import json
+
+url = "http://api.worldbank.org/v2/country?format=json&per_page=400"
+
+try:
+    data = requests.get(url, timeout=10).json()
+    if not isinstance(data, list) or len(data) < 2:
+        raise ValueError("Unexpected World Bank API structure.")
+    countries_meta = pd.DataFrame(data[1])
+except Exception as e:
+    raise RuntimeError(f"Failed to fetch World Bank metadata: {e}")
+
+# Clean and filter valid countries (exclude aggregates)
+countries_meta = (
+    countries_meta[countries_meta["region"].apply(lambda x: x["value"] != "Aggregates")]
+    [["id", "name", "capitalCity", "iso2Code"]]
+    .rename(columns={
+        "id": "iso3_code",
+        "name": "country",
+        "capitalCity": "capital",
+        "iso2Code": "country_code"
+    })
+    .sort_values("iso3_code")
+    .reset_index(drop=True)
+)
+
+# Save metadata for reproducibility
+meta_path = data_processed / "worldbank_countries.csv"
+countries_meta.to_csv(meta_path, index=False)
+
+print(f"Retrieved {len(countries_meta)} valid countries. Saved to: {meta_path}")
+countries_meta.head()
+
+```
+
+------------------------------------------------------------------------
+
+## 4. Load and Inspect GDP Dataset
+
+The raw GDP file from the World Bank contains GDP (current USD) per year and country (1960–2024), along with metadata and non-country aggregates.
+
+Before cleaning, we load and inspect the dataset to confirm its structure and validate that the file was saved correctly.
+
+```{python}
+# 4. Load and Inspect GDP Dataset ---------------------------------------------
+"""
+Load the raw World Bank GDP dataset and inspect its structure.
+Skip metadata rows directly and validate the dataset integrity.
+"""
+
+# Define path to the raw GDP file
+gdp_path = data_raw / "gdp_raw.csv"
+
+# Validate file existence before loading
+if not gdp_path.exists():
+    raise FileNotFoundError(f"Missing input file: {gdp_path.resolve()}")
+
+# Load dataset, skipping the metadata rows and using semicolon separator
+gdp_raw = pd.read_csv(gdp_path, skiprows=4, sep=";")
+
+print(f"Loaded {len(gdp_raw)} records from {gdp_path.name}")
+gdp_raw.head()
+
+```
+
+------------------------------------------------------------------------
+
+## 5. Clean and Reshape GDP Data
+
+To make the GDP dataset compatible with the rest of the pipeline, we perform a full cleaning process.\
+This includes filtering valid countries, merging ISO codes, removing redundant columns, reshaping into tidy format, and exporting the result for later use.
+
+### 5.1 Filter Valid Countries
+
+We skip metadata rows and filter only real countries identified by ISO-3 codes in the metadata file.
+
+```{python}
+# 5.1 Filter Valid Countries ---------------------------------------------------
+"""
+Skip metadata rows and retain only valid countries identified
+in the World Bank metadata (ISO-3 codes).
+"""
+
+# Load previously saved metadata
+countries_meta = pd.read_csv(meta_path)
+
+# Load GDP dataset, skipping metadata rows
+gdp_clean = pd.read_csv(gdp_path, skiprows=4)
+
+# Filter dataset to include only valid ISO-3 country codes
+valid_iso3 = countries_meta["iso3_code"].unique().tolist()
+gdp_clean = gdp_clean[gdp_clean["Country Code"].isin(valid_iso3)].copy()
+
+print(f"Filtered dataset retains {len(gdp_clean)} valid country entries.")
+
+```
+
+### 5.2 Merge ISO-2 Codes
+
+Next, we merge ISO-2 codes into the GDP dataset to ensure alignment with the ScrapeThisSite and Weather datasets.
+
+```{python}
+# 5.2 Merge ISO-2 Codes --------------------------------------------------------
+"""
+Merge ISO-2 codes from World Bank metadata for compatibility with
+the other datasets in the project.
+"""
+
+# Merge GDP data with ISO-2 country codes from metadata
+gdp_merged = gdp_clean.merge(
+    countries_meta[["iso3_code", "country_code"]],
+    how="left",
+    left_on="Country Code",
+    right_on="iso3_code"
+)
+
+# Validate mapping completeness
+unique_iso2 = gdp_merged["country_code"].nunique()
+print(f"Merged ISO mapping successfully. Unique ISO-2 codes: {unique_iso2}")
+
+```
+
+### 5.3 Remove Redundant Columns
+
+The raw GDP file includes unnecessary columns (indicator names, codes, and empty columns).
+
+We drop them to simplify the dataset before reshaping.
+
+```{python}
+# 5.3 Remove Redundant Columns -------------------------------------------------
+"""
+Drop non-informative metadata columns (e.g., Indicator names, codes)
+and unnamed columns resulting from CSV parsing.
+"""
+
+# Rename main identifier column and drop unnecessary metadata
+gdp_merged = (
+    gdp_merged
+    .rename(columns={"Country Name": "country"})
+    .drop(columns=["Country Code", "iso3_code", "Indicator Name", "Indicator Code"], errors="ignore")
+)
+
+# Remove automatically generated 'Unnamed' columns from CSV parsing
+gdp_merged = gdp_merged.loc[:, ~gdp_merged.columns.str.contains("^Unnamed")]
+
+# Confirm cleaned structure
+print(f"Columns retained after cleaning: {list(gdp_merged.columns)[:5]} ...")
+
+```
+
+### 5.4 Reshape to Tidy Format
+
+We convert the dataset from wide to tidy format — where each row represents a single `(country, year, GDP)` pair.
+
+This format is much more flexible for SQL storage, analysis, and visualization.
+
+```{python}
+# 5.4 Reshape to Tidy Format ---------------------------------------------------
+"""
+Transform the dataset from wide (one column per year)
+to long (tidy) format for analytical flexibility and SQL integration.
+"""
+
+# Reshape GDP data into tidy (long) format
+gdp_tidy = gdp_merged.melt(
+    id_vars=["country", "country_code"],
+    var_name="year",
+    value_name="gdp_usd"
+)
+
+# Convert year column to numeric and drop missing GDP values
+gdp_tidy["year"] = pd.to_numeric(gdp_tidy["year"], errors="coerce")
+gdp_tidy = gdp_tidy.dropna(subset=["gdp_usd"])
+
+# Confirm structure and record count
+print(f"Tidy dataset prepared with {len(gdp_tidy)} country-year records.")
+
+```
+
+### 5.5 Export Tidy Dataset
+
+Finally, we export the cleaned dataset to the processed data directory, where it can be reused by subsequent notebooks.
+
+```{python}
+# 5.5 Export Tidy Dataset ------------------------------------------------------
+"""
+Export the cleaned and reshaped dataset to the processed data folder
+for reproducible access and later SQL ingestion.
+"""
+
+# Define export path
+gdp_tidy_path = data_processed / "gdp_tidy.csv"
+
+# Save tidy dataset as CSV
+gdp_tidy.to_csv(gdp_tidy_path, index=False)
+
+# Confirm export and preview first records
+print(f"Tidy GDP dataset successfully saved to: {gdp_tidy_path.resolve()}")
+gdp_tidy.head()
+
+```
+
+------------------------------------------------------------------------
+
+## 6. Store GDP Data in SQLite Database
+
+After cleaning, we persist the GDP dataset into the unified database. This ensures centralized, version-controlled access to all project data.
+
+```{python}
+# 6. Store GDP Data in SQLite Database ----------------------------------------
+"""
+Persist the tidy GDP dataset into the unified SQLite database.
+An index on country_code is created to optimize future joins.
+"""
+
+# Establish connection and store dataset
+with sqlite3.connect(db_path) as conn:
+    gdp_tidy.to_sql("worldbank_gdp_updated", conn, if_exists="replace", index=False)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gdp_country ON worldbank_gdp_updated(country_code);")
+
+print(f"Table 'worldbank_gdp_updated' successfully stored in: {db_path.resolve()}")
+
+```
+
+------------------------------------------------------------------------
+
+## 7. Integrate All Datasets via SQL
+
+We now join the three main datasets — *ScrapeThisSite*, *Weather*, and *World Bank GDP* — using ISO-2 codes as a common key.\
+
+This produces a single table containing geographical, climatic, and economic information per country.
+
+```{python}
+# 7. Integrate All Datasets via SQL -------------------------------------------
+"""
+Join scraped, weather, and GDP data into a unified SQL table.
+Only records present in all datasets are retained.
+"""
+
+# Define SQL integration scripts
+sql_view = """
+DROP VIEW IF EXISTS vw_countries_weather;
+CREATE VIEW vw_countries_weather AS
+SELECT
+    s.country_name AS country,
+    s.country_code,
+    s.capital,
+    s.population,
+    s.area_km2,
+    w.temp_celsius,
+    w.humidity
+FROM scrapethissite AS s
+JOIN weather AS w USING (country_code);
+"""
+
+sql_join = """
+DROP TABLE IF EXISTS joined_scrape_weather_gdp;
+CREATE TABLE joined_scrape_weather_gdp AS
+WITH latest_gdp AS (
+    SELECT
+        country_code,
+        gdp_usd AS current_gdp,
+        CAST(year AS INTEGER) AS gdp_year,
+        ROW_NUMBER() OVER (PARTITION BY country_code ORDER BY year DESC) AS rn
+    FROM worldbank_gdp_updated
+)
+SELECT
+    cw.country,
+    cw.country_code,
+    cw.capital,
+    cw.population,
+    cw.area_km2,
+    cw.temp_celsius,
+    cw.humidity,
+    lg.current_gdp,
+    lg.gdp_year
+FROM vw_countries_weather AS cw
+INNER JOIN latest_gdp AS lg
+    ON cw.country_code = lg.country_code
+    AND lg.rn = 1;
+"""
+
+# Execute SQL scripts and load integrated dataset
+with sqlite3.connect(db_path) as conn:
+    conn.executescript(sql_view)
+    conn.executescript(sql_join)
+    integrated = pd.read_sql("SELECT * FROM joined_scrape_weather_gdp;", conn)
+
+print(f"Integrated dataset successfully created with {len(integrated)} countries.")
+integrated.head()
+
+```
+
+------------------------------------------------------------------------
+
+## 8. Export Integrated Dataset
+
+We export the final integrated dataset to `data/processed/joined_scrape_weather_gdp.csv`.
+
+```{python}
+# 8. Export Integrated Dataset -------------------------------------------------
+"""
+Export the integrated table combining country, weather, and GDP data.
+"""
+
+# Define export path for integrated dataset
+joined_path = data_processed / "joined_scrape_weather_gdp.csv"
+
+# Save the integrated table to processed data directory
+integrated.to_csv(joined_path, index=False, encoding="utf-8")
+
+# Confirm successful export
+print(f"Integrated dataset successfully exported to: {joined_path.resolve()}")
+
+# Preview the first rows of the exported dataset
+pd.read_csv(joined_path).head()
+
+```
+
+------------------------------------------------------------------------
+
+## 9. Compute Average GDP (1960–2024)
+
+To summarize long-term performance, we compute each country's **average GDP** from 1960–2024 and update the table.
+
+```{python}
+# 9. Compute Average GDP (1960–2024) ------------------------------------------
+"""
+Compute average GDP (1960–2024) per country and update the table.
+SQLite does not support IF NOT EXISTS in ALTER TABLE, so we handle it safely.
+"""
+
+with sqlite3.connect(db_path) as conn:
+
+    # Add the new column if it does not already exist
+    try:
+        conn.execute("ALTER TABLE worldbank_gdp_updated ADD COLUMN avg_gdp_1960_to_2024 REAL;")
+    except sqlite3.OperationalError:
+        pass  # Column already exists, continue silently
+
+    # Compute and update the average GDP values
+    conn.execute("""
+        WITH avg_vals AS (
+            SELECT
+                country_code,
+                AVG(CAST(gdp_usd AS REAL)) AS avg_gdp_1960_to_2024
+            FROM worldbank_gdp_updated
+            WHERE CAST(year AS INTEGER) BETWEEN 1960 AND 2024
+            GROUP BY country_code
+        )
+        UPDATE worldbank_gdp_updated
+        SET avg_gdp_1960_to_2024 = (
+            SELECT avg_gdp_1960_to_2024
+            FROM avg_vals
+            WHERE avg_vals.country_code = worldbank_gdp_updated.country_code
+        );
+    """)
+
+print("Average GDP successfully computed and stored in the database.")
+
+```
+
+------------------------------------------------------------------------
+
+### 10. Visualize GDP Trends
+
+Finally, we visualize GDP evolution for a random selection of countries between 1960–2024.
+
+This helps reveal growth trajectories and long-term economic disparities.
+
+```{python}
+# 10. Visualize GDP Trends -----------------------------------------------------
+"""
+Plot GDP evolution (1960–2024) for a random selection of countries.
+A 99th percentile filter is applied to remove outliers and improve readability.
+"""
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+
+# Load GDP data for visualization
+with sqlite3.connect(db_path) as conn:
+    gdp_df = pd.read_sql("""
+        SELECT country, year, gdp_usd
+        FROM worldbank_gdp_updated
+        WHERE CAST(year AS INTEGER) BETWEEN 1960 AND 2024
+          AND gdp_usd IS NOT NULL;
+    """, conn)
+
+# Randomly select 10 countries for visualization
+countries = random.sample(gdp_df["country"].dropna().unique().tolist(), 10)
+subset = gdp_df[gdp_df["country"].isin(countries)].copy()
+subset["year"] = subset["year"].astype(int)
+
+# Filter out extreme GDP values (top 1%)
+subset = subset[subset["gdp_usd"] < subset["gdp_usd"].quantile(0.99)]
+
+# Plot GDP evolution for selected countries
+plt.figure(figsize=(10, 6))
+sns.lineplot(data=subset, x="year", y="gdp_usd", hue="country")
+
+plt.title("GDP Trends (1960–2024) – Random Sample of Countries")
+plt.xlabel("Year")
+plt.ylabel("GDP (USD)")
+plt.legend(title="Country", bbox_to_anchor=(1.05, 1), loc="upper left")
+plt.tight_layout()
+
+# Save and display figure
+fig_path = figures_dir / "gdp_trends_random10.png"
+plt.savefig(fig_path, dpi=300)
+plt.show()
+
+print(f"Figure successfully saved to: {fig_path.resolve()}")
+
+```
+
+------------------------------------------------------------------------
+
+### 11. Summary
+
+This notebook successfully integrated and harmonized the three primary datasets of the project.
+
+By retrieving official country metadata, cleaning and reshaping the World Bank GDP dataset, and merging it with the geographical and climatic data, we built a consistent and reproducible database.
+
+The integration ensures uniform ISO-2 country identifiers and prepares the data for advanced statistical analysis.
+
+The computed GDP averages and visualizations provide an overview of global economic evolution, forming a robust foundation for future modeling and insight generation.
+
+------------------------------------------------------------------------
